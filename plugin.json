@@ -1,0 +1,5 @@
+{
+  "name": "agy-cli-statusline",
+  "version": "0.2.0",
+  "description": "Enhanced Antigravity CLI status-line HUD with cumulative session & Swarm/subagent token stats, prompt cache hit rate, and fast quota refresh"
+}

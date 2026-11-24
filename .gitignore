@@ -1,0 +1,9 @@
+# Local configs, caches, logs, and OS junk
+config.json
+.DS_Store
+*.log
+*.bak
+*.tmp-*
+node_modules/
+.env
+.env.*

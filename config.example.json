@@ -12,6 +12,7 @@
   "show_icons": true,
   "show_session_tokens": true,
   "show_cache_hit_rate": true,
+  "show_token_speed": true,
   "include_subagent_tokens": true,
   "cache_hit_rate_mode": "session",
   "session_tokens_layout": "line",

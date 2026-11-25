@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-An enhanced **Antigravity CLI (`agy`) status-line HUD plugin** adding **cumulative session token breakdown (with recursive `/swarm` & subagent aggregation)**, **prompt cache hit rate**, and **low-latency adaptive quota refresh** on top of a compact, zero-dependency terminal HUD.
+An enhanced **Antigravity CLI (`agy`) status-line HUD plugin** adding **cumulative session token breakdown (with recursive `/swarm` & subagent aggregation)**, **prompt cache hit rate**, **weighted average output token speed (`tok/s`)**, and **low-latency adaptive quota refresh** on top of a compact, zero-dependency terminal HUD.
 
 > **Upstream Attribution**: Derived from [`franksde/agy-hud`](https://github.com/franksde/agy-hud) (`v0.1.12`, MIT License). Original copyright notices and bundled third-party licenses are preserved in [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -14,6 +14,7 @@ An enhanced **Antigravity CLI (`agy`) status-line HUD plugin** adding **cumulati
 
 - **Cumulative Session Token Breakdown (`show_session_tokens`)**: Adds a clean 3rd HUD line displaying cumulative session **Total**, uncached **In**, **Out** (including thinking tokens), and **Cache** read tokens (matching `ccusage antigravity` totals exactly).
 - **Prompt Cache Hit Rate (`show_cache_hit_rate`, `cache_hit_rate_mode`)**: Displays `Cache / (In + Cache)` colored by hit efficiency (`>=70%` green, `>=40%` yellow, `<40%` orange), configurable across `"session"`, `"last"`, or `"both"`.
+- **Average Output Token Speed (`show_token_speed`)**: Displays weighted session average output throughput (`Avg XX.X tok/s`) across root and `/swarm` worker responses, accurately excluding tool execution, interactive approval waits, and user think time (`>=60` green, `>=30` yellow, `<30` orange).
 - **Recursive `/swarm` & Subagent Aggregation (`include_subagent_tokens`)**: Automatically discovers and aggregates all spawned `/swarm` workers, nested worker helpers, `invoke_subagent`, and `run_workflow` transcripts with a `[+N]` badge, while strictly ignoring UUIDs appearing inside `read_file`, `run_command`, or `read_board` outputs.
 - **Sub-Millisecond Incremental Transcript Cache**: Tracks `inode + mtime + byte offset` per transcript in `session_tokens_cache.json` (128-entry LRU, `0600` permissions) with native `Buffer.includes` pre-filtering — `<1ms` warm redraws with zero disk writes while idle.
 - **Adaptive Low-Latency Quota Refresh**:
@@ -72,6 +73,7 @@ Copy [config.example.json](config.example.json) to `~/.config/agy-cli-statusline
 | --- | --- | --- | --- |
 | `show_session_tokens` | `boolean` | `true` | Show cumulative session `Tokens (In · Out · Cache)` |
 | `show_cache_hit_rate` | `boolean` | `true` | Show prompt `Cache Hit` percentage |
+| `show_token_speed` | `boolean` | `true` | Show weighted session average output speed (`Avg XX tok/s`) |
 | `include_subagent_tokens` | `boolean` | `true` | Recursively include `/swarm` workers & subagents (`[+N]` badge) |
 | `cache_hit_rate_mode` | `"session"` \| `"last"` \| `"both"` | `"session"` | Hit-rate scope: cumulative session, latest turn, or both |
 | `session_tokens_layout` | `"line"` \| `"inline"` | `"line"` | Dedicated 3rd line, or attempt inline on Line 2 on wide terminals |

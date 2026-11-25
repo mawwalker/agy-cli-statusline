@@ -184,6 +184,7 @@ function defaultConfig() {
     showIcons: true,
     showSessionTokens: true,
     showCacheHitRate: true,
+    showTokenSpeed: true,
     includeSubagentTokens: true,
     cacheHitRateMode: "session",
     sessionTokensLayout: "line",
@@ -228,6 +229,7 @@ function merge(base, patch) {
   if (typeof patch.show_icons === "boolean") base.showIcons = patch.show_icons;
   if (typeof patch.show_session_tokens === "boolean") base.showSessionTokens = patch.show_session_tokens;
   if (typeof patch.show_cache_hit_rate === "boolean") base.showCacheHitRate = patch.show_cache_hit_rate;
+  if (typeof patch.show_token_speed === "boolean") base.showTokenSpeed = patch.show_token_speed;
   if (typeof patch.include_subagent_tokens === "boolean") base.includeSubagentTokens = patch.include_subagent_tokens;
   if (typeof patch.cache_hit_rate_mode === "string" && (patch.cache_hit_rate_mode === "session" || patch.cache_hit_rate_mode === "last" || patch.cache_hit_rate_mode === "both")) {
     base.cacheHitRateMode = patch.cache_hit_rate_mode;
@@ -814,7 +816,7 @@ function truncateColumns(input, width) {
 }
 
 // src/sessionTokens.ts
-var tokenCacheSchemaVersion = 2;
+var tokenCacheSchemaVersion = 3;
 var tokenNeedleInput = Buffer.from('"input_tokens"');
 var tokenNeedleOutput = Buffer.from('"output_tokens"');
 var tokenNeedleCacheRead = Buffer.from('"cache_read_tokens"');
@@ -822,9 +824,17 @@ var tokenNeedleCacheCreate = Buffer.from('"cache_creation_tokens"');
 var tokenNeedleCacheReadInput = Buffer.from('"cache_read_input_tokens"');
 var tokenNeedleCacheCreateInput = Buffer.from('"cache_creation_input_tokens"');
 var childNeedleGeneric = Buffer.from('"GENERIC"');
+var childNeedleUserInput = Buffer.from('"USER_INPUT"');
 var childNeedleConvSnake = Buffer.from("conversation_id");
 var childNeedleConvCamel = Buffer.from("conversationId");
 var uuidExactRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var speedMinStepMs = 500;
+var speedMaxStepMs = 600 * 1e3;
+var speedMinTps = 2;
+var speedMaxTps = 1500;
+var speedTypeGenericRe = /"type"\s*:\s*"GENERIC"/;
+var speedTypeUserRe = /"type"\s*:\s*"USER_INPUT"/;
+var speedCreatedAtRe = /"created_at"\s*:\s*"([^"]+)"/;
 function emptySessionTokens() {
   return {
     inputTokens: 0,
@@ -838,9 +848,19 @@ function emptySessionTokens() {
     lastTurnTimeMs: 0,
     lastStepIndex: -1,
     turns: 0,
+    speedOutputTokens: 0,
+    speedDurationMs: 0,
+    speedSteps: 0,
+    pendingSpeedStep: null,
     childIds: [],
     childCount: 0
   };
+}
+function cloneSessionTokensStats(raw) {
+  const base = { ...emptySessionTokens(), ...raw };
+  base.childIds = Array.isArray(raw?.childIds) ? [...raw.childIds] : [];
+  base.pendingSpeedStep = isRecord(raw?.pendingSpeedStep) ? { ...raw.pendingSpeedStep } : null;
+  return base;
 }
 function finiteNonNeg(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
@@ -1029,10 +1049,84 @@ function extractChildIdsFromEntry(entry, stats, selfConvId) {
     }
   }
 }
+function settlePendingSpeedStep(stats, endMs) {
+  const pending = stats.pendingSpeedStep;
+  if (!pending || pending.settled) {
+    return;
+  }
+  pending.settled = true;
+  const dtMs = endMs - pending.createdMs;
+  if (!Number.isFinite(dtMs) || dtMs < speedMinStepMs || dtMs > speedMaxStepMs) {
+    return;
+  }
+  const out = finiteNonNeg(pending.outputTokens);
+  if (out <= 0) {
+    return;
+  }
+  const rate = out / (dtMs / 1e3);
+  if (!Number.isFinite(rate) || rate < speedMinTps || rate > speedMaxTps) {
+    return;
+  }
+  stats.speedOutputTokens = finiteNonNeg(stats.speedOutputTokens) + out;
+  stats.speedDurationMs = finiteNonNeg(stats.speedDurationMs) + dtMs;
+  stats.speedSteps = finiteNonNeg(stats.speedSteps) + 1;
+}
+function onToolStepTimestamp(stats, toolCreatedMs) {
+  const pending = stats.pendingSpeedStep;
+  if (!pending || pending.settled || pending.expectedTools <= 0 || !Number.isFinite(toolCreatedMs)) {
+    return;
+  }
+  pending.seenTools = (pending.seenTools ?? 0) + 1;
+  if (toolCreatedMs > (pending.lastToolMs ?? 0)) {
+    pending.lastToolMs = toolCreatedMs;
+  }
+  if (pending.seenTools >= pending.expectedTools) {
+    settlePendingSpeedStep(stats, pending.lastToolMs);
+  }
+}
+function onUserInputBoundary(stats) {
+  const pending = stats.pendingSpeedStep;
+  if (pending && !pending.settled && pending.lastToolMs > pending.createdMs) {
+    settlePendingSpeedStep(stats, pending.lastToolMs);
+  }
+  stats.pendingSpeedStep = null;
+}
 function accumulateTranscriptLine(lineBuf, stats, selfConvId = "") {
   const hasTokens = lineHasTokenField(lineBuf);
   const mayHaveChild = lineMayHaveChildSpawn(lineBuf);
+  const hasPendingSpeed = Boolean(stats.pendingSpeedStep && !stats.pendingSpeedStep.settled);
   if (!hasTokens && !mayHaveChild) {
+    if (!hasPendingSpeed) {
+      return;
+    }
+    const hasGeneric = lineBuf.includes(childNeedleGeneric);
+    const hasUser = !hasGeneric && lineBuf.includes(childNeedleUserInput);
+    if (!hasGeneric && !hasUser) {
+      return;
+    }
+    const head = lineBuf.subarray(0, Math.min(lineBuf.length, 512)).toString("utf8");
+    if (hasUser && speedTypeUserRe.test(head)) {
+      onUserInputBoundary(stats);
+      return;
+    }
+    if (hasGeneric && speedTypeGenericRe.test(head)) {
+      const m = speedCreatedAtRe.exec(head);
+      if (m) {
+        onToolStepTimestamp(stats, Date.parse(m[1]));
+        return;
+      }
+    }
+    try {
+      const quickEntry = JSON.parse(lineBuf.toString("utf8"));
+      if (isRecord(quickEntry)) {
+        if (quickEntry.type === "USER_INPUT") {
+          onUserInputBoundary(stats);
+        } else if (quickEntry.type === "GENERIC" && typeof quickEntry.created_at === "string") {
+          onToolStepTimestamp(stats, Date.parse(quickEntry.created_at));
+        }
+      }
+    } catch {
+    }
     return;
   }
   let entry;
@@ -1044,8 +1138,16 @@ function accumulateTranscriptLine(lineBuf, stats, selfConvId = "") {
   if (!isRecord(entry)) {
     return;
   }
-  if (mayHaveChild) {
-    extractChildIdsFromEntry(entry, stats, selfConvId);
+  if (entry.type === "USER_INPUT") {
+    onUserInputBoundary(stats);
+  }
+  if (entry.type === "GENERIC") {
+    if (mayHaveChild) {
+      extractChildIdsFromEntry(entry, stats, selfConvId);
+    }
+    if (hasPendingSpeed && typeof entry.created_at === "string") {
+      onToolStepTimestamp(stats, Date.parse(entry.created_at));
+    }
   }
   if (!hasTokens) {
     return;
@@ -1072,6 +1174,22 @@ function accumulateTranscriptLine(lineBuf, stats, selfConvId = "") {
   const createdMs = typeof entry.created_at === "string" ? Date.parse(entry.created_at) : NaN;
   if (Number.isFinite(createdMs) && createdMs >= (stats.lastTurnTimeMs ?? 0)) {
     stats.lastTurnTimeMs = createdMs;
+  }
+  if (stats.pendingSpeedStep && !stats.pendingSpeedStep.settled && stats.pendingSpeedStep.lastToolMs > stats.pendingSpeedStep.createdMs) {
+    settlePendingSpeedStep(stats, stats.pendingSpeedStep.lastToolMs);
+  }
+  if (out > 0 && Number.isFinite(createdMs)) {
+    stats.pendingSpeedStep = {
+      stepIndex,
+      createdMs,
+      outputTokens: out,
+      expectedTools: Array.isArray(entry.tool_calls) ? entry.tool_calls.length : 0,
+      seenTools: 0,
+      lastToolMs: 0,
+      settled: false
+    };
+  } else {
+    stats.pendingSpeedStep = null;
   }
   if (stepIndex >= 0) {
     stats.lastStepIndex = stepIndex;
@@ -1172,15 +1290,18 @@ function readSingleTranscriptStats(transcriptPath, convId, cacheMap) {
   }
   const cached = cacheMap[transcriptPath];
   if (cached && cached.schemaVersion === tokenCacheSchemaVersion && cached.ino === stat.ino && cached.offset === stat.size && cached.mtimeMs === stat.mtimeMs && isRecord(cached.stats)) {
-    return [{ ...emptySessionTokens(), ...cached.stats, childIds: Array.isArray(cached.stats.childIds) ? [...cached.stats.childIds] : [] }, false];
+    return [cloneSessionTokensStats(cached.stats), false];
   }
   let stats = emptySessionTokens();
   let startOffset = 0;
   if (cached && cached.schemaVersion === tokenCacheSchemaVersion && cached.ino === stat.ino && typeof cached.offset === "number" && cached.offset >= 0 && cached.offset <= stat.size && isRecord(cached.stats)) {
-    stats = { ...emptySessionTokens(), ...cached.stats, childIds: Array.isArray(cached.stats.childIds) ? [...cached.stats.childIds] : [] };
+    stats = cloneSessionTokensStats(cached.stats);
     startOffset = cached.offset;
   }
   const nextOffset = scanTranscriptFromOffset(transcriptPath, startOffset, stat.size, stats, convId);
+  if (stats.pendingSpeedStep && !stats.pendingSpeedStep.settled && stats.pendingSpeedStep.expectedTools === 0 && nextOffset === stat.size) {
+    settlePendingSpeedStep(stats, stat.mtimeMs);
+  }
   cacheMap[transcriptPath] = {
     schemaVersion: tokenCacheSchemaVersion,
     ino: stat.ino,
@@ -1245,6 +1366,9 @@ function readSessionTokens(payload, cfg = null) {
     total.cacheReadTokens += childStats.cacheReadTokens;
     total.cacheCreationTokens += childStats.cacheCreationTokens;
     total.turns += childStats.turns;
+    total.speedOutputTokens = finiteNonNeg(total.speedOutputTokens) + finiteNonNeg(childStats.speedOutputTokens);
+    total.speedDurationMs = finiteNonNeg(total.speedDurationMs) + finiteNonNeg(childStats.speedDurationMs);
+    total.speedSteps = finiteNonNeg(total.speedSteps) + finiteNonNeg(childStats.speedSteps);
     total.childCount += 1;
     if ((childStats.lastTurnTimeMs ?? 0) > (total.lastTurnTimeMs ?? 0)) {
       total.lastTurnTimeMs = childStats.lastTurnTimeMs;
@@ -1360,6 +1484,27 @@ function cacheHitColor(pct) {
   }
   return colorOrange;
 }
+function formatTokenSpeed(tps) {
+  if (tps === null || !Number.isFinite(tps) || tps <= 0) {
+    return "--";
+  }
+  if (tps >= 100) {
+    return `${formatInt(Math.round(tps))} tok/s`;
+  }
+  return `${Number(tps.toFixed(1))} tok/s`;
+}
+function tokenSpeedColor(tps) {
+  if (tps === null || !Number.isFinite(tps) || tps <= 0) {
+    return colorMuted;
+  }
+  if (tps >= 60) {
+    return colorGreen;
+  }
+  if (tps >= 30) {
+    return colorYellow;
+  }
+  return colorOrange;
+}
 function sessionTokenMetrics(stats) {
   const s = stats ?? emptySessionTokens();
   const input = finiteNonNeg(s.inputTokens);
@@ -1374,8 +1519,21 @@ function sessionTokenMetrics(stats) {
   const lastCacheCreate = finiteNonNeg(s.lastCacheCreationTokens);
   const lastTotalInput = lastIn + lastCacheRead + lastCacheCreate;
   const lastHitPct = lastTotalInput > 0 ? lastCacheRead / lastTotalInput * 100 : null;
+  const speedOut = finiteNonNeg(s.speedOutputTokens);
+  const speedMs = finiteNonNeg(s.speedDurationMs);
+  const avgSpeedTps = speedOut > 0 && speedMs > 0 ? speedOut / (speedMs / 1e3) : null;
   const childCount = finiteNonNeg(s.childCount);
-  return { input, output, cacheRead, cacheCreate, totalInput, total, sessionHitPct, lastHitPct, childCount };
+  return { input, output, cacheRead, cacheCreate, totalInput, total, sessionHitPct, lastHitPct, avgSpeedTps, childCount };
+}
+function renderTokenSpeedSegment(metrics, config, compact) {
+  if (!config.showTokenSpeed) {
+    return "";
+  }
+  const val = colorize(formatTokenSpeed(metrics.avgSpeedTps), tokenSpeedColor(metrics.avgSpeedTps), config.color);
+  if (compact && metrics.avgSpeedTps !== null) {
+    return val;
+  }
+  return `Avg ${val}`;
 }
 function renderCacheHitSegment(metrics, config, compact) {
   if (!config.showCacheHitRate) {
@@ -1395,7 +1553,7 @@ function renderCacheHitSegment(metrics, config, compact) {
   return `${compact ? "Hit " : "Cache Hit "}${colorPct(metrics.sessionHitPct)}`;
 }
 function renderSessionTokensLine(stats, config, width) {
-  if (!config.showSessionTokens && !config.showCacheHitRate) {
+  if (!config.showSessionTokens && !config.showCacheHitRate && !config.showTokenSpeed) {
     return "";
   }
   const m = sessionTokenMetrics(stats);
@@ -1411,10 +1569,14 @@ function renderSessionTokensLine(stats, config, width) {
   const minTok = config.showSessionTokens ? `Tok ${totalText}${subBadge}` : "";
   const fullCache = renderCacheHitSegment(m, config, false);
   const compactCache = renderCacheHitSegment(m, config, true);
+  const fullSpeed = renderTokenSpeedSegment(m, config, false);
+  const compactSpeed = renderTokenSpeedSegment(m, config, true);
   const candidates = [
-    joinHeader(fullTok, fullCache),
-    joinHeader(compactTok, compactCache),
-    joinHeader(ultraTok, compactCache),
+    joinHeader(fullTok, fullCache, fullSpeed),
+    joinHeader(fullTok, fullCache, compactSpeed),
+    joinHeader(compactTok, compactCache, compactSpeed),
+    joinHeader(ultraTok, compactCache, compactSpeed),
+    joinHeader(minTok, compactCache, compactSpeed),
     joinHeader(minTok, compactCache)
   ];
   for (const candidate of candidates) {
@@ -1511,7 +1673,7 @@ function renderMultiline(payload, config, width, modelSegment, ctxPct, quota, br
     line2 = `${formatInt(ctxPct)}%`;
   }
   line2 = fit(line2, width);
-  if (config.showSessionTokens || config.showCacheHitRate) {
+  if (config.showSessionTokens || config.showCacheHitRate || config.showTokenSpeed) {
     const line3 = renderSessionTokensLine(sessionTokens, config, width);
     if (config.sessionTokensLayout === "inline") {
       const combined = joinHeader(line2, line3);
@@ -1546,10 +1708,11 @@ function renderSingleLine(payload, config, width, modelSegment, ctxPct, quota, s
     }
     usage2 = colorize(text, colorMuted, config.color);
   }
-  const metrics = config.showSessionTokens || config.showCacheHitRate ? sessionTokenMetrics(sessionTokens) : null;
+  const metrics = config.showSessionTokens || config.showCacheHitRate || config.showTokenSpeed ? sessionTokenMetrics(sessionTokens) : null;
   const subBadge = metrics && metrics.childCount > 0 ? ` [+${formatInt(metrics.childCount)}]` : "";
   const sessionTokText = config.showSessionTokens && metrics ? `Tok ${colorize(formatSessionTokens(metrics.total), colorCyan, config.color)}${subBadge} (${formatSessionTokens(metrics.input)}/${formatSessionTokens(metrics.output)}/${formatSessionTokens(metrics.cacheRead)})` : "";
   const cacheHitText = config.showCacheHitRate && metrics ? renderCacheHitSegment(metrics, config, true) : "";
+  const speedText = config.showTokenSpeed && metrics ? renderTokenSpeedSegment(metrics, config, true) : "";
   const stateText = config.showAgentState ? colorize(stateLabel, stateColor(stateLabel), config.color) : "";
   const costText = renderCost(payload.cost, config);
   const titleText = renderTitle(payload.conversation_title, config);
@@ -1558,7 +1721,8 @@ function renderSingleLine(payload, config, width, modelSegment, ctxPct, quota, s
     bar = progressBar(ctxPct, 10, config.color);
   }
   const levels = [
-    [coloredBadge, ctx, tokens, bar, sessionTokText, cacheHitText, usage2, titleText, stateText, costText],
+    [coloredBadge, ctx, tokens, bar, sessionTokText, cacheHitText, speedText, usage2, titleText, stateText, costText],
+    [coloredBadge, ctx, tokens, bar, sessionTokText, cacheHitText, speedText, usage2, stateText, costText],
     [coloredBadge, ctx, tokens, bar, sessionTokText, cacheHitText, usage2, stateText, costText],
     [coloredBadge, ctx, bar, sessionTokText, cacheHitText, usage2, stateText],
     [coloredBadge, ctx, tokens, bar, usage2, stateText, costText],
@@ -2192,7 +2356,7 @@ function nerdFontLines(report) {
 }
 
 // src/main.ts
-var version = "0.2.0";
+var version = "0.3.0";
 var consumedQuotaRefreshMs = 15 * 1e3;
 var untouchedQuotaRefreshMs = 30 * 1e3;
 function renderStatusline(input, cfg = defaultConfig(), cache = null, precomputedSessionTokens = void 0) {
@@ -2218,7 +2382,7 @@ function renderStatusline(input, cfg = defaultConfig(), cache = null, precompute
       branch2 = sanitizedBranch(process.env.AGY_HUD_GIT_BRANCH ?? "");
     }
   }
-  const sessionTokens = cfg.showSessionTokens || cfg.showCacheHitRate ? precomputedSessionTokens !== void 0 ? precomputedSessionTokens : readSessionTokens(payload, cfg) : null;
+  const sessionTokens = cfg.showSessionTokens || cfg.showCacheHitRate || cfg.showTokenSpeed ? precomputedSessionTokens !== void 0 ? precomputedSessionTokens : readSessionTokens(payload, cfg) : null;
   try {
     return render(payload, {
       config: cfg,

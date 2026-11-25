@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README.en.md)
 
-一个增强版 **Antigravity CLI (`agy`) 状态栏 HUD 插件**，在保留紧凑清晰终端排版的基准上，新增 **会话累计 Token 统计（含 `/swarm` 与 Subagent 递归汇总）**、**Prompt 缓存命中率** 以及 **低延迟自适应配额刷新**。
+一个增强版 **Antigravity CLI (`agy`) 状态栏 HUD 插件**，在保留紧凑清晰终端排版的基准上，新增 **会话累计 Token 统计（含 `/swarm` 与 Subagent 递归汇总）**、**Prompt 缓存命中率**、**会话输出均速 (`tok/s`)** 以及 **低延迟自适应配额刷新**。
 
 > **上游致谢**：本项目基于优秀的开源项目 [`franksde/agy-hud`](https://github.com/franksde/agy-hud)（`v0.1.12`，MIT License）二次开发和维护。保留其完整的 MIT 许可与第三方声明（见 [LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）。
 
@@ -12,10 +12,11 @@
 
 ## 相比上游 `franksde/agy-hud` 新增与增强的功能
 
-| 维度 | 上游 `agy-hud v0.1.12` | 本仓库 `agy-cli-statusline v0.2.0` |
+| 维度 | 上游 `agy-hud v0.1.12` | 本仓库 `agy-cli-statusline v0.3.0` |
 | --- | --- | --- |
 | **会话累计 Token 明细** | 仅显示当前上下文窗口占比 (`Context`) | **新增第 3 行**，实时汇总当前会话累计消耗：**总量、新输入 (`In`)、输出含思考 (`Out`)、缓存读取 (`Cache`)**（以及可选 `CWrite`），口径与 `ccusage antigravity` 精确对齐 |
 | **Prompt 缓存命中率** | 不支持 | **新增 `Cache Hit` 命中率** `Cache / (In + Cache)`，按命中质量自动着色（`≥70%` 绿、`≥40%` 黄、`<40%` 橙），支持 **会话累计 (`session`) / 最近一轮 (`last`) / 双显示 (`both`)** |
+| **会话平均输出速度 (`tok/s`)** | 不支持 | **新增 `Avg XX tok/s` 加权输出均速**（`Σoutput_tokens / Σ推理耗时`）：并行工具调用精准对齐至最后一个工具派发时间、纯文本终答取落盘 `mtimeMs`，自动剔除工具执行/人工审批/用户停顿时间；按速率着色（`≥60` 绿、`≥30` 黄、`<30` 橙） |
 | **`/swarm` & Subagent 递归汇总** | 不支持 | **自动递归发现并累加所有 `/swarm` Worker、嵌套 Helper、Subagent 与 Workflow 子会话**的 Token 与缓存命中率，并以 `[+N]` 徽标直观提示子 Agent 数量；同时严格过滤 `read_file` / `run_command` / `read_board` 输出防止误统计 |
 | **增量字节偏移缓存** | 无 | 按 `inode + mtime + offset` 增量扫描 `transcript.jsonl`，并用原生 `Buffer.includes` 跳过非 Token 行；128 条会话 LRU 缓存，空闲重绘 **< 1ms 且零磁盘写入** |
 | **配额刷新实时性** | 活跃 `60s` / 空闲 `5min`，且结束后易被 60s 冷却锁死、后台完成后不接力 | **三级自适应节奏**：活跃期 `20s` 预刷、回合结束 / 轮次递增产生 `dirty` 标记时冷却仅 `10s`、真正空闲回落 `120s`；回合结束（`active -> idle`）若已有刷新在途，异步短等最多 `1200ms` 争取**当帧直接呈现新额度**（打字/流式输出 `0ms` 不阻塞） |
@@ -83,6 +84,7 @@ cp config.example.json ~/.config/agy-cli-statusline/config.json
 | --- | --- | --- | --- |
 | `show_session_tokens` | `boolean` | `true` | 显示当前会话累计 `Tokens (In · Out · Cache)` |
 | `show_cache_hit_rate` | `boolean` | `true` | 显示 Prompt 缓存命中率 `Cache Hit` |
+| `show_token_speed` | `boolean` | `true` | 显示会话加权平均输出速度 `Avg XX tok/s`（剔除工具耗时与人工等待） |
 | `include_subagent_tokens` | `boolean` | `true` | 递归汇总当前会话派生的 `/swarm` Worker 与 Subagent Token（带 `[+N]` 标记） |
 | `cache_hit_rate_mode` | `"session"` \| `"last"` \| `"both"` | `"session"` | 命中率口径：会话累计、最近一轮、或两者同时显示 |
 | `session_tokens_layout` | `"line"` \| `"inline"` | `"line"` | 多行模式下独立第 3 行显示，或宽终端下尝试拼在第 2 行末尾 |

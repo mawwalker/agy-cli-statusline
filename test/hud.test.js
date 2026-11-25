@@ -24,6 +24,7 @@ function baseConfig(overrides = {}) {
     showIcons: false,
     showSessionTokens: true,
     showCacheHitRate: true,
+    showTokenSpeed: true,
     includeSubagentTokens: true,
     cacheHitRateMode: "session",
     sessionTokensLayout: "line",
@@ -75,7 +76,7 @@ describe("agy-cli-statusline", () => {
       const cfg = baseConfig();
       let lines = hud.renderStatusline(mkPayload(), cfg, null).split("\n");
       assert.equal(lines.length, 3);
-      assert.equal(lines[2], "Tokens 23.5k (In 12k · Out 1.5k · Cache 10k) │ Cache Hit 45.5%");
+      assert.equal(lines[2], "Tokens 23.5k (In 12k · Out 1.5k · Cache 10k) │ Cache Hit 45.5% │ Avg --");
 
       // Append duplicate step_index 3 + half-written step 5
       const partial = JSON.stringify({ step_index: 5, type: "PLANNER_RESPONSE", input_tokens: 1000, cache_read_tokens: 19000, output_tokens: 500 });
@@ -83,20 +84,20 @@ describe("agy-cli-statusline", () => {
       fs.appendFileSync(tf, JSON.stringify({ step_index: 3, type: "PLANNER_RESPONSE", input_tokens: 2000, cache_read_tokens: 10000, output_tokens: 1000 }) + "\n" + partial.slice(0, mid));
 
       lines = hud.renderStatusline(mkPayload(), cfg, null).split("\n");
-      assert.equal(lines[2], "Tokens 23.5k (In 12k · Out 1.5k · Cache 10k) │ Cache Hit 45.5%");
+      assert.equal(lines[2], "Tokens 23.5k (In 12k · Out 1.5k · Cache 10k) │ Cache Hit 45.5% │ Avg --");
 
       // Complete partial line
       fs.appendFileSync(tf, partial.slice(mid) + "\n");
       lines = hud.renderStatusline(mkPayload(), cfg, null).split("\n");
-      assert.equal(lines[2], "Tokens 44k (In 13k · Out 2k · Cache 29k) │ Cache Hit 69%");
+      assert.equal(lines[2], "Tokens 44k (In 13k · Out 2k · Cache 29k) │ Cache Hit 69% │ Avg --");
 
-      // cache_hit_rate_mode: last & both
+      // cache_hit_rate_mode: last & both (with showTokenSpeed disabled)
       assert.equal(
-        hud.renderStatusline(mkPayload(), baseConfig({ cacheHitRateMode: "last" }), null).split("\n")[2],
+        hud.renderStatusline(mkPayload(), baseConfig({ cacheHitRateMode: "last", showTokenSpeed: false }), null).split("\n")[2],
         "Tokens 44k (In 13k · Out 2k · Cache 29k) │ Cache Hit 95%"
       );
       assert.equal(
-        hud.renderStatusline(mkPayload(), baseConfig({ cacheHitRateMode: "both" }), null).split("\n")[2],
+        hud.renderStatusline(mkPayload(), baseConfig({ cacheHitRateMode: "both", showTokenSpeed: false }), null).split("\n")[2],
         "Tokens 44k (In 13k · Out 2k · Cache 29k) │ Cache Hit 69% (Last 95%)"
       );
     } finally {
@@ -154,7 +155,7 @@ describe("agy-cli-statusline", () => {
 
       const cfg = baseConfig();
       const out = hud.renderStatusline(payloadStr, cfg, null);
-      assert.equal(out.split("\n")[2], "Tokens 525k [+5] (In 80k · Out 15k · Cache 430k) │ Cache Hit 84.3%");
+      assert.equal(out.split("\n")[2], "Tokens 525k [+5] (In 80k · Out 15k · Cache 430k) │ Cache Hit 84.3% │ Avg --");
 
       // Warm hit must not rewrite cache
       const mtimeBefore = fs.statSync(tokenCachePath).mtimeMs;
@@ -163,12 +164,12 @@ describe("agy-cli-statusline", () => {
 
       // Incremental append on worker 1
       fs.appendFileSync(w1Path, JSON.stringify({ step_index: 5, type: "PLANNER_RESPONSE", created_at: "2026-11-23T08:10:00Z", input_tokens: 20000, cache_read_tokens: 470000, output_tokens: 5000 }) + "\n");
-      assert.equal(hud.renderStatusline(payloadStr, cfg, null).split("\n")[2], "Tokens 1.02M [+5] (In 100k · Out 20k · Cache 900k) │ Cache Hit 90%");
+      assert.equal(hud.renderStatusline(payloadStr, cfg, null).split("\n")[2], "Tokens 1.02M [+5] (In 100k · Out 20k · Cache 900k) │ Cache Hit 90% │ Avg --");
 
       // Disable subagent aggregation
       assert.equal(
         hud.renderStatusline(payloadStr, baseConfig({ includeSubagentTokens: false }), null).split("\n")[2],
-        "Tokens 11k (In 10k · Out 1k · Cache 0) │ Cache Hit 0%"
+        "Tokens 11k (In 10k · Out 1k · Cache 0) │ Cache Hit 0% │ Avg --"
       );
 
       // Narrow widths never exceed terminal_width
@@ -264,12 +265,89 @@ describe("agy-cli-statusline", () => {
       const rolloverCache = { timestamp: new Date().toISOString(), source: "usage", models: {}, quota: { "gemini-5h": { remaining_fraction: 0.40, reset_time: soonReset } } };
       const outRollover = hud.renderStatusline(
         mkPayload("idle", { quota: { "gemini-5h": { remaining_fraction: 1.0, reset_time: nextReset, reset_in_seconds: 18000 } } }),
-        baseConfig({ showSessionTokens: false, showCacheHitRate: false }),
+        baseConfig({ showSessionTokens: false, showCacheHitRate: false, showTokenSpeed: false }),
         rolloverCache
       );
       assert.ok(outRollover.includes("100%"), `Expected new window 100%, got: ${outRollover}`);
     } finally {
       delete process.env.AGY_HUD_CONFIG;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("computes weighted average output token speed across streaming tool calls, incremental appends, final mtime, and Swarm workers", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-sl-t4-"));
+    try {
+      const brainDir = path.join(tmp, "brain");
+      process.env.AGY_HUD_QUOTA_CACHE = path.join(tmp, "quota_cache.json");
+      const hud = require(hudPath);
+
+      const coordId = "12121212-1212-1212-1212-121212121212";
+      const workerId = "34343434-3434-3434-3434-343434343434";
+
+      // Step 1: 1200 output tokens, 2 parallel tool calls dispatched at +4s and +15s => 1200 / 15s = 80 tok/s
+      // Step 4: text-only reply followed by USER_INPUT 120s later => human think time MUST NOT be counted
+      // Step 6: 0s quantization outlier (same second) => MUST be ignored
+      const coordPath = makeTranscript(brainDir, coordId, [
+        { step_index: 1, type: "PLANNER_RESPONSE", created_at: "2026-11-25T08:00:00Z", input_tokens: 10000, cache_read_tokens: 0, output_tokens: 1200, tool_calls: [{ name: "edit_file" }, { name: "edit_file" }] },
+        { step_index: 2, type: "GENERIC", created_at: "2026-11-25T08:00:04Z", content: "Created At: x\nCompleted At: y\n" + "z".repeat(4000) },
+        { step_index: 3, type: "GENERIC", created_at: "2026-11-25T08:00:15Z", content: `Created At: x\nCompleted At: y\n{"status":"added","name":"w1","conversation_id":"${workerId}"}` },
+        { step_index: 4, type: "PLANNER_RESPONSE", created_at: "2026-11-25T08:00:20Z", input_tokens: 1000, cache_read_tokens: 9000, output_tokens: 400 },
+        { step_index: 5, type: "USER_INPUT", created_at: "2026-11-25T08:02:20Z", content: "next question" },
+        { step_index: 6, type: "PLANNER_RESPONSE", created_at: "2026-11-25T08:02:21Z", input_tokens: 1000, cache_read_tokens: 10000, output_tokens: 100, tool_calls: [{ name: "read_file" }] },
+        { step_index: 7, type: "GENERIC", created_at: "2026-11-25T08:02:21Z", content: "Created At: x\nCompleted At: y\nok" }
+      ]);
+
+      // Worker: 800 output tokens over 10s => 80 tok/s, plus 2000 tokens over 20s => 100 tok/s
+      // Combined weighted avg = (1200 + 800 + 2000) / (15 + 10 + 20) = 4000 / 45 = 88.9 tok/s
+      makeTranscript(brainDir, workerId, [
+        { step_index: 1, type: "PLANNER_RESPONSE", created_at: "2026-11-25T08:00:20Z", input_tokens: 5000, cache_read_tokens: 15000, output_tokens: 800, tool_calls: [{ name: "run_command" }] },
+        { step_index: 2, type: "GENERIC", created_at: "2026-11-25T08:00:30Z", content: "Created At: x\nCompleted At: y\ndone" },
+        { step_index: 3, type: "PLANNER_RESPONSE", created_at: "2026-11-25T08:00:35Z", input_tokens: 2000, cache_read_tokens: 20000, output_tokens: 2000, tool_calls: [{ name: "write_file" }] },
+        { step_index: 4, type: "GENERIC", created_at: "2026-11-25T08:00:55Z", content: "Created At: x\nCompleted At: y\ndone" }
+      ]);
+
+      const mkPayload = (w = 120) => JSON.stringify({
+        version: "1.5.15",
+        conversation_id: coordId,
+        transcript_path: coordPath,
+        model: { display_name: "Gemini 4 Neon (XHigh)" },
+        plan_tier: "Pro",
+        cwd: "/tmp/demo",
+        agent_state: "idle",
+        terminal_width: w,
+        context_window: { total_input_tokens: 10000, context_window_size: 1000000 }
+      });
+
+      // Root only: 1200 / 15s = 80 tok/s
+      const rootOnly = hud.renderStatusline(mkPayload(), baseConfig({ includeSubagentTokens: false }), null).split("\n")[2];
+      assert.ok(rootOnly.endsWith("│ Avg 80 tok/s"), `Expected root Avg 80 tok/s, got: ${rootOnly}`);
+
+      // Root + Swarm worker: 4000 / 45s = 88.9 tok/s
+      const withSwarm = hud.renderStatusline(mkPayload(), baseConfig(), null).split("\n")[2];
+      assert.ok(withSwarm.endsWith("│ Avg 88.9 tok/s"), `Expected combined Avg 88.9 tok/s, got: ${withSwarm}`);
+
+      // Incremental live append of a final text-only reply (expectedTools === 0) settled via stat.mtimeMs
+      const replyCreated = new Date(Date.now() - 10 * 1000);
+      fs.appendFileSync(coordPath, JSON.stringify({
+        step_index: 8, type: "PLANNER_RESPONSE", created_at: replyCreated.toISOString(),
+        input_tokens: 500, cache_read_tokens: 11000, output_tokens: 500
+      }) + "\n");
+      const replyFinished = new Date(replyCreated.getTime() + 10 * 1000);
+      fs.utimesSync(coordPath, replyFinished, replyFinished);
+
+      // Root only now: (1200 + 500) / (15 + 10) = 1700 / 25 = 68 tok/s
+      const afterFinal = hud.renderStatusline(mkPayload(), baseConfig({ includeSubagentTokens: false }), null).split("\n")[2];
+      assert.ok(afterFinal.endsWith("│ Avg 68 tok/s"), `Expected root Avg 68 tok/s after final reply, got: ${afterFinal}`);
+
+      // Narrow width degradation keeps line within width
+      for (const w of [80, 60, 45, 30]) {
+        const res = hud.renderStatusline(mkPayload(w), baseConfig({ color: true }), null);
+        for (const ln of res.split("\n")) {
+          assert.ok(stripAnsi(ln).length <= w, `Line exceeded width ${w}: ${stripAnsi(ln)}`);
+        }
+      }
+    } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

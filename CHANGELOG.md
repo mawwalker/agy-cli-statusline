@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0] - 2026-11-25
+
+### Added
+- **Average Output Token Speed (`show_token_speed`, default `true`)**: Displays weighted session average output throughput (`Avg XX.X tok/s`) on Line 3 (and compact `XX.X tok/s` on narrower terminals / single-line mode), colored by throughput tier (`>=60` green, `>=30` yellow, `<30` orange).
+- **Accurate Streaming Tool-Call & Final-Reply Timing**:
+  - Measures multi-tool LLM turns from `PLANNER_RESPONSE.created_at` to the final dispatched `GENERIC` tool step's `created_at` (excluding tool execution and interactive user approval waits).
+  - Measures final text-only replies (no tool calls) via `transcript.jsonl` `mtimeMs` at flush time while ignoring human think time before subsequent `USER_INPUT`.
+  - Aggregates `speedOutputTokens` and `speedDurationMs` across recursive `/swarm` workers and subagents when `include_subagent_tokens` is enabled.
+  - Bumped `session_tokens_cache.json` schema to `v3` and added zero-`JSON.parse` header fast-path for `GENERIC` / `USER_INPUT` timestamps.
+
+---
+
 ## [0.2.0] - 2026-11-23
 
 Forked and enhanced from upstream [`franksde/agy-hud` v0.1.12](https://github.com/franksde/agy-hud).
